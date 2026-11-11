@@ -38,6 +38,13 @@ Get one free at <https://aistudio.google.com/app/apikey>.
 
 ## Usage
 
+### Option 1: Modern Web Interface (Streamlit) 🌐
+```bash
+streamlit run app.py
+```
+This opens an interactive ChatGPT-like web UI in your browser where you can drag & drop your PDF and chat directly.
+
+### Option 2: Terminal / CLI Interface 💻
 ```bash
 python rag_chat.py path/to/your/document.pdf
 ```
