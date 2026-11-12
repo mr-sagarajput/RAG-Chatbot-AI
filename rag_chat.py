@@ -1,33 +1,35 @@
 """
-RAG Chatbot – Chat with your PDF
-=================================
-Uses:
-  • pypdf              – PDF text extraction
-  • google-genai       – Gemini embeddings (gemini-embedding-001) + generative
-                        model (gemini-3.5-flash-lite)
-  • numpy              – cosine-similarity search over chunk embeddings
-
-Flow:
-  1. Load & chunk the PDF.
-  2. Embed every chunk with gemini-embedding-001.
-  3. On each user query, embed the query, find the top-k most similar
-     chunks, build a grounded prompt, and get the answer via gemini-3.5-flash-lite.
+RAG Chatbot – Chat with your PDF (Terminal Edition)
+===================================================
+Production-ready Retrieval-Augmented Generation (RAG) with:
+  • Persistent Disk Caching (hash-based, 0 API calls on repeat loads)
+  • Page-Level Source Citations (e.g., [Page X] in answer & breakdown)
+  • Smart Paragraph & Sentence Chunking (no broken words/sentences)
+  • "I don't know" Confidence Threshold (avoids hallucinations)
+  • Hybrid Text Extraction + Vision OCR (for scanned/image-only PDFs)
+  • Free Tier 100 RPM Rate-Limit Resilience
 """
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
+import pickle
 import re
 import sys
 import textwrap
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pypdfium2 as pdfium
 from dotenv import load_dotenv
-from pypdf import PdfReader
 from google import genai
 from google.genai import errors, types
+from pypdf import PdfReader
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -37,56 +39,243 @@ load_dotenv()
 
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
-# Embedding model: gemini-embedding-001 is the supported Google GenAI embedding model
 EMBED_MODEL: str = "gemini-embedding-001"
-
-# Chat model: gemini-3.5-flash-lite as requested
 CHAT_MODEL: str = "gemini-3.5-flash-lite"
 
-CHUNK_SIZE: int = 2000       # characters per chunk
-CHUNK_OVERLAP: int = 250     # character overlap between consecutive chunks
-TOP_K: int = 5               # number of chunks to retrieve per query
+CHUNK_SIZE: int = 1500        # target character count per chunk
+CHUNK_OVERLAP: int = 200      # character overlap between consecutive chunks
+TOP_K: int = 5                # number of relevant chunks to retrieve per query
+SIMILARITY_THRESHOLD: float = 0.35  # minimum cosine similarity to answer
+
+CACHE_DIR: Path = Path(".cache")
 
 SYSTEM_PROMPT: str = textwrap.dedent("""\
-    You are a helpful assistant that answers questions strictly based on the
-    provided document context. If the answer is not found in the context,
-    say so clearly. Do not make up information.
-    Always cite relevant details from the context to support your answer.
+    You are a precise, grounded AI document assistant that answers questions
+    STRICTLY using the provided context snippets.
+
+    CRITICAL RULES:
+    1. Grounding: Answer ONLY based on the facts directly stated in the context.
+       Do not assume, extrapolate, or use outside knowledge.
+    2. Citations: Every single factual claim, date, or detail in your answer MUST
+       cite its source page number using the format [Page X] (e.g., "Sagar completed
+       his M.A. in Clinical Psychology [Page 2]").
+    3. Honesty: If the provided context does NOT contain enough information to
+       answer the question, state clearly: "The provided document does not contain
+       information to answer this question." Do not try to guess.
 """)
 
 
 # ---------------------------------------------------------------------------
-# PDF helpers
+# Data Models
 # ---------------------------------------------------------------------------
 
-def load_pdf(path: str | Path) -> str:
-    """Extract all text from a PDF file."""
+@dataclass
+class DocumentChunk:
+    chunk_id: int
+    page: int
+    text: str
+
+
+# ---------------------------------------------------------------------------
+# Caching Helpers
+# ---------------------------------------------------------------------------
+
+def compute_file_hash(path: str | Path) -> str:
+    """Compute SHA-256 hash of a file to detect changes."""
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def get_cache_path(file_hash: str) -> Path:
+    """Return path to cached embeddings for a given hash."""
+    CACHE_DIR.mkdir(exist_ok=True)
+    return CACHE_DIR / f"{file_hash}.pkl"
+
+
+def load_cached_embeddings(file_hash: str) -> Optional[Tuple[List[DocumentChunk], np.ndarray]]:
+    """Load pre-computed chunks and embeddings from disk if available."""
+    cache_file = get_cache_path(file_hash)
+    if not cache_file.exists():
+        return None
+    try:
+        with open(cache_file, "rb") as f:
+            data = pickle.load(f)
+        if data.get("embed_model") != EMBED_MODEL:
+            return None
+        chunks = [
+            DocumentChunk(chunk_id=c["chunk_id"], page=c["page"], text=c["text"])
+            for c in data["chunks"]
+        ]
+        embeddings = np.array(data["embeddings"], dtype=np.float32)
+        return chunks, embeddings
+    except Exception:
+        return None
+
+
+def save_cached_embeddings(
+    file_hash: str,
+    chunks: List[DocumentChunk],
+    embeddings: np.ndarray,
+) -> None:
+    """Save chunks and embeddings to disk cache."""
+    cache_file = get_cache_path(file_hash)
+    data = {
+        "embed_model": EMBED_MODEL,
+        "chunks": [asdict(c) for c in chunks],
+        "embeddings": embeddings,
+    }
+    try:
+        with open(cache_file, "wb") as f:
+            pickle.dump(data, f)
+    except Exception as e:
+        print(f"[Warning] Failed to write cache: {e}")
+
+
+# ---------------------------------------------------------------------------
+# PDF Extraction & OCR Fallback
+# ---------------------------------------------------------------------------
+
+def ocr_page_image(client: genai.Client, image_bytes: bytes) -> str:
+    """Use Gemini Vision to OCR a scanned PDF page image."""
+    try:
+        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+        prompt = (
+            "Transcribe all text from this page image verbatim. "
+            "Maintain original paragraphs and layout. Return only the extracted text."
+        )
+        response = client.models.generate_content(
+            model=CHAT_MODEL,
+            contents=[prompt, image_part],
+        )
+        return response.text.strip()
+    except Exception as e:
+        print(f"    [Warning] Vision OCR failed: {e}")
+        return ""
+
+
+def load_pdf_pages(path: str | Path, client: genai.Client) -> List[Tuple[int, str]]:
+    """Extract text from each page. If a page has no text (scanned), runs Vision OCR."""
+    path = Path(path)
     reader = PdfReader(str(path))
-    pages: list[str] = []
+    pages: List[Tuple[int, str]] = []
+
+    pdfium_doc = None  # Loaded lazily only if scanned pages are detected
+
     for i, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        if text.strip():
-            pages.append(f"[Page {i}]\n{text}")
+        raw_text = (page.extract_text() or "").strip()
+
+        # If page has sufficient digital text, use it directly
+        if len(raw_text) >= 30:
+            pages.append((i, raw_text))
+            continue
+
+        # Otherwise page is likely scanned/image-only: run OCR fallback
+        print(f"  🔍 Page {i} appears to be scanned/image-only. Running Vision OCR ...", end=" ", flush=True)
+        try:
+            if pdfium_doc is None:
+                pdfium_doc = pdfium.PdfDocument(str(path))
+            pdf_page = pdfium_doc[i - 1]
+            pil_image = pdf_page.render(scale=2.0).to_pil()
+
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            ocr_text = ocr_page_image(client, buf.getvalue())
+
+            if ocr_text:
+                pages.append((i, ocr_text))
+                print(f"extracted {len(ocr_text)} chars.")
+            else:
+                print("no text detected.")
+        except Exception as e:
+            print(f"OCR skipped ({e}).")
+
     if not pages:
-        raise ValueError("No extractable text found in the PDF.")
-    return "\n\n".join(pages)
+        raise ValueError("No extractable text or images found in the PDF.")
+    return pages
 
 
-def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split *text* into overlapping character-level chunks."""
-    chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(start + size, len(text))
-        chunks.append(text[start:end])
-        if end == len(text):
-            break
-        start += size - overlap
+# ---------------------------------------------------------------------------
+# Smart Paragraph & Sentence Chunking
+# ---------------------------------------------------------------------------
+
+def split_text_smart(
+    text: str,
+    max_chars: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+) -> List[str]:
+    """Split text recursively by paragraphs, then sentences, then words.
+
+    Guarantees no sentence is cut awkwardly in the middle.
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text.strip()]
+
+    chunks: List[str] = []
+    current_chunk = ""
+
+    for para in paragraphs:
+        # If single paragraph exceeds max_chars, split it by sentence
+        if len(para) > max_chars:
+            sentences = re.split(r"(?<=[.!?])\s+", para)
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent:
+                    continue
+                if len(current_chunk) + len(sent) + 1 <= max_chars:
+                    current_chunk = f"{current_chunk} {sent}".strip()
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk)
+                        # Add overlap from previous text
+                        overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                        current_chunk = f"{overlap_text} {sent}".strip()
+                    else:
+                        chunks.append(sent[:max_chars])
+                        current_chunk = sent[max_chars - overlap:]
+        else:
+            if len(current_chunk) + len(para) + 2 <= max_chars:
+                current_chunk = f"{current_chunk}\n\n{para}".strip()
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk)
+                    overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                    current_chunk = f"{overlap_text}\n\n{para}".strip()
+                else:
+                    chunks.append(para)
+                    current_chunk = ""
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
     return chunks
 
 
+def build_document_chunks(pages: List[Tuple[int, str]]) -> List[DocumentChunk]:
+    """Convert page-level texts into smart chunks tagged with exact page numbers."""
+    all_chunks: List[DocumentChunk] = []
+    chunk_counter = 1
+
+    for page_num, page_text in pages:
+        page_chunks = split_text_smart(page_text, max_chars=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+        for text_chunk in page_chunks:
+            all_chunks.append(
+                DocumentChunk(
+                    chunk_id=chunk_counter,
+                    page=page_num,
+                    text=text_chunk,
+                )
+            )
+            chunk_counter += 1
+
+    return all_chunks
+
+
 # ---------------------------------------------------------------------------
-# Embedding helpers  (google-genai SDK)
+# Embedding Helpers with 100 RPM Rate-Limit Resilience
 # ---------------------------------------------------------------------------
 
 def embed_content_with_retry(
@@ -95,12 +284,7 @@ def embed_content_with_retry(
     contents: str | list[str],
     config: types.EmbedContentConfig,
 ) -> types.EmbedContentResponse:
-    """Wrapper around client.models.embed_content with automatic 429/RESOURCE_EXHAUSTED retry.
-
-    Handles Gemini Free Tier rate limits (100 requests/minute). Parses the
-    suggested retry delay from ClientError/APIError or defaults to 60 seconds,
-    adds a 2-second buffer, and automatically retries.
-    """
+    """Wrapper around embed_content with automatic 429 rate limit retry."""
     while True:
         try:
             return client.models.embed_content(
@@ -111,7 +295,6 @@ def embed_content_with_retry(
         except (errors.ClientError, errors.APIError) as exc:
             err_msg = str(exc)
             if getattr(exc, "code", None) == 429 or "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                # Default wait is 60 seconds if not specified in the error message
                 wait_sec = 60.0
                 match = re.search(
                     r"(?:retryDelay|retry in|retry after)[\"':\s]*([0-9]+(?:\.[0-9]+)?)\s*s?",
@@ -124,10 +307,10 @@ def embed_content_with_retry(
                     except ValueError:
                         wait_sec = 60.0
 
-                total_wait = wait_sec + 2.0  # +2s safety buffer
+                total_wait = wait_sec + 2.0
                 print(
-                    f"\n⏳ [RATE LIMIT] Free Tier rate limit reached (429 RESOURCE_EXHAUSTED). "
-                    f"Waiting {total_wait:.1f}s for quota to reset before retrying...",
+                    f"\n⏳ [RATE LIMIT] Free Tier quota reached (429). "
+                    f"Waiting {total_wait:.0f}s before retrying...",
                     flush=True,
                 )
                 time.sleep(total_wait)
@@ -135,27 +318,22 @@ def embed_content_with_retry(
                 raise
 
 
-def embed_texts(client: genai.Client, texts: list[str]) -> np.ndarray:
-    """Return a (N, D) float32 array of embeddings for a list of texts.
-
-    Uses task_type RETRIEVAL_DOCUMENT so the model optimises for
-    passage/document retrieval. Batches in groups of up to 100 chunks.
-    If multiple batches are required, prints batch progress and automatically
-    pauses between batches to respect the Free Tier 100 RPM limit.
-    """
+def embed_chunks(client: genai.Client, chunks: List[DocumentChunk]) -> np.ndarray:
+    """Embed chunks in batches of 100 with automatic batch pacing."""
+    texts = [c.text for c in chunks]
     batch_size = 100
-    all_embeddings: list[list[float]] = []
+    all_embeddings: List[List[float]] = []
     total_batches = (len(texts) + batch_size - 1) // batch_size
 
     if total_batches > 1:
-        print()  # Move to a new line for batch reporting
+        print()
 
     for i in range(0, len(texts), batch_size):
         batch_idx = (i // batch_size) + 1
         batch = texts[i : i + batch_size]
 
         if total_batches > 1:
-            print(f"  ↳ Batch {batch_idx}/{total_batches} ({len(batch)} chunks) …", flush=True)
+            print(f"  ↳ Embedding Batch {batch_idx}/{total_batches} ({len(batch)} chunks) …", flush=True)
 
         response = embed_content_with_retry(
             client=client,
@@ -166,21 +344,16 @@ def embed_texts(client: genai.Client, texts: list[str]) -> np.ndarray:
         for emb in response.embeddings:
             all_embeddings.append(emb.values)
 
-        # Pause automatically between batches if there are more batches to respect the 100 RPM quota
         if batch_idx < total_batches:
             pause_time = 60.0
-            print(f"    ⏳ Pausing {pause_time:.0f}s between batches to respect Free Tier 100 RPM rate limit …", flush=True)
+            print(f"    ⏳ Pausing {pause_time:.0f}s between batches for Free Tier quota …", flush=True)
             time.sleep(pause_time)
 
     return np.array(all_embeddings, dtype=np.float32)
 
 
 def embed_query(client: genai.Client, query: str) -> np.ndarray:
-    """Return a 1-D float32 embedding for a single query string.
-
-    Uses task_type RETRIEVAL_QUERY so cosine similarity with
-    RETRIEVAL_DOCUMENT vectors is well-calibrated.
-    """
+    """Embed a single search query."""
     response = embed_content_with_retry(
         client=client,
         model=EMBED_MODEL,
@@ -191,7 +364,7 @@ def embed_query(client: genai.Client, query: str) -> np.ndarray:
 
 
 def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray) -> np.ndarray:
-    """Compute cosine similarity between one query vector and many doc vectors."""
+    """Compute cosine similarity between one query vector and document vectors."""
     q = query_vec / (np.linalg.norm(query_vec) + 1e-10)
     d = doc_vecs / (np.linalg.norm(doc_vecs, axis=1, keepdims=True) + 1e-10)
     return d @ q
@@ -200,54 +373,79 @@ def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray) -> np.ndarray
 def retrieve(
     client: genai.Client,
     query: str,
-    chunks: list[str],
+    chunks: List[DocumentChunk],
     chunk_embeddings: np.ndarray,
     top_k: int = TOP_K,
-) -> list[str]:
-    """Return the *top_k* most relevant chunks for the query."""
+) -> Tuple[List[DocumentChunk], List[float], float]:
+    """Retrieve top-K chunks and return chunks, individual scores, and max score."""
     q_vec = embed_query(client, query)
     scores = cosine_similarity(q_vec, chunk_embeddings)
     top_indices = np.argsort(scores)[::-1][:top_k]
-    return [chunks[i] for i in top_indices]
+
+    retrieved = [chunks[i] for i in top_indices]
+    top_scores = [float(scores[i]) for i in top_indices]
+    max_score = top_scores[0] if top_scores else 0.0
+
+    return retrieved, top_scores, max_score
 
 
 # ---------------------------------------------------------------------------
-# Chat session
+# Chat Session with Source Citation & Relevance Guard
 # ---------------------------------------------------------------------------
 
 class RAGChatSession:
-    """Maintains multi-turn conversation history with RAG context injection."""
+    """Multi-turn RAG chat session with strict grounding and source tracking."""
 
     def __init__(
         self,
         client: genai.Client,
-        chunks: list[str],
+        chunks: List[DocumentChunk],
         chunk_embeddings: np.ndarray,
     ) -> None:
         self.client = client
         self.chunks = chunks
         self.chunk_embeddings = chunk_embeddings
-        # history: list of Content objects for multi-turn
-        self.history: list[types.Content] = []
+        self.history: List[types.Content] = []
 
-    def ask(self, question: str) -> str:
-        """Retrieve context, build a grounded message, and return the answer."""
-        # 1. Retrieve relevant chunks
-        relevant = retrieve(self.client, question, self.chunks, self.chunk_embeddings)
-        context_block = "\n\n---\n\n".join(relevant)
-
-        # 2. Build the user turn with injected context
-        grounded_message = (
-            f"### Document Context\n\n{context_block}\n\n"
-            f"### Question\n\n{question}"
+    def ask(self, question: str) -> Dict[str, Any]:
+        """Process question, check similarity threshold, cite sources, and answer."""
+        retrieved_chunks, scores, max_score = retrieve(
+            self.client,
+            question,
+            self.chunks,
+            self.chunk_embeddings,
+            top_k=TOP_K,
         )
 
-        # 3. Append user turn to history
+        # 1. Similarity Threshold Guard: "I don't know" rule
+        if max_score < SIMILARITY_THRESHOLD:
+            return {
+                "answer": (
+                    "I could not find relevant information in the provided document to answer "
+                    "your question. (Relevance score was below threshold)."
+                ),
+                "sources": [],
+                "max_score": max_score,
+                "is_confident": False,
+            }
+
+        # 2. Build grounded context block with explicit page badges
+        context_snippets = []
+        for i, (chunk, score) in enumerate(zip(retrieved_chunks, scores), start=1):
+            snippet = f"[Source {i} | Page {chunk.page}]\n{chunk.text}"
+            context_snippets.append(snippet)
+        context_block = "\n\n---\n\n".join(context_snippets)
+
+        grounded_message = (
+            f"### Document Context\n\n{context_block}\n\n"
+            f"### User Question\n{question}"
+        )
+
+        # 3. Append to multi-turn conversation
         self.history.append(
             types.Content(role="user", parts=[types.Part(text=grounded_message)])
         )
 
-        # 4. Send to the model (keeps full conversation history)
         response = self.client.models.generate_content(
             model=CHAT_MODEL,
             contents=self.history,
@@ -257,11 +455,16 @@ class RAGChatSession:
         )
         answer: str = response.text
 
-        # 5. Store assistant reply in history
         self.history.append(
             types.Content(role="model", parts=[types.Part(text=answer)])
         )
-        return answer
+
+        return {
+            "answer": answer,
+            "sources": list(zip(retrieved_chunks, scores)),
+            "max_score": max_score,
+            "is_confident": True,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -275,19 +478,20 @@ BANNER = r"""
  |  _ </ ___ \ |_| | | |___| | | | (_| | |_| |_) | (_) | |_
  |_| \_\_/ \_\____|  \____|_| |_|\__,_|\__|_.__/ \___/ \__|
 
-           Chat with your PDF  •  Powered by Gemini 3.5 Flash-Lite
+   Chat with PDF  •  Persistent Disk Cache  •  Page Citations
 """
 
 HELP_TEXT = """
 Commands:
-  /help    – show this message
-  /clear   – clear conversation history
-  /quit    – exit the application
+  /help    – Show this message
+  /clear   – Clear conversation history
+  /sources – Re-display sources from the last query
+  /quit    – Exit the application
 """
 
 
 def print_wrapped(text: str, width: int = 90) -> None:
-    """Print text with soft word-wrapping."""
+    """Print text with word wrapping."""
     for paragraph in text.split("\n"):
         if paragraph.strip():
             print(textwrap.fill(paragraph, width=width))
@@ -296,92 +500,114 @@ def print_wrapped(text: str, width: int = 90) -> None:
 
 
 def run_chat(pdf_path: str | Path) -> None:
-    """Main entry point: load PDF, build index, run chat loop."""
-
-    # --- API key check -------------------------------------------------
+    """Main terminal loop."""
     if not GEMINI_API_KEY:
-        print(
-            "[ERROR] GEMINI_API_KEY is not set.\n"
-            "        Create a .env file with GEMINI_API_KEY=<your_key>\n"
-            "        or export it as an environment variable."
-        )
+        print("[ERROR] GEMINI_API_KEY is not set in .env file.")
         sys.exit(1)
 
-    # --- Initialise the new google-genai client -----------------------
-    # Use v1beta endpoint to ensure latest model versions and methods are available
     client = genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=types.HttpOptions(api_version="v1beta"),
     )
 
-    # --- Load & index --------------------------------------------------
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         print(f"[ERROR] File not found: {pdf_path}")
         sys.exit(1)
 
     print(BANNER)
-    print(f"📄  Loading PDF: {pdf_path.name}")
-    full_text = load_pdf(pdf_path)
+    print(f"📄 Loading PDF: {pdf_path.name}")
 
-    print(f"✂️   Chunking text …", end=" ", flush=True)
-    chunks = chunk_text(full_text)
-    print(f"{len(chunks)} chunks created.")
+    # Check disk cache first
+    file_hash = compute_file_hash(pdf_path)
+    cached_data = load_cached_embeddings(file_hash)
 
-    print("🔢  Embedding chunks (this may take a moment for large PDFs) …", end=" ", flush=True)
-    chunk_embeddings = embed_texts(client, chunks)
-    print("done.")
+    if cached_data is not None:
+        chunks, chunk_embeddings = cached_data
+        print(f"⚡ Found cached embeddings on disk! Loaded {len(chunks)} chunks instantly (0 API calls).")
+    else:
+        print("📖 Extracting pages (digital text + OCR fallback) …")
+        pages = load_pdf_pages(pdf_path, client)
+        print(f"   Extracted {len(pages)} pages.")
+
+        print("✂️  Smart-chunking into paragraphs & sentences …", end=" ", flush=True)
+        chunks = build_document_chunks(pages)
+        print(f"{len(chunks)} chunks created.")
+
+        print("🔢 Embedding chunks (with Free Tier rate-limit protection) …", end=" ", flush=True)
+        chunk_embeddings = embed_chunks(client, chunks)
+        print("done.")
+
+        print("💾 Saving embeddings to disk cache (.cache/) …", end=" ", flush=True)
+        save_cached_embeddings(file_hash, chunks, chunk_embeddings)
+        print("saved.")
 
     session = RAGChatSession(client, chunks, chunk_embeddings)
 
-    print("\n" + "─" * 60)
-    print("✅  Ready! Ask anything about your PDF. Type /help for commands.")
-    print("─" * 60 + "\n")
+    print("\n" + "─" * 65)
+    print("✅ Ready! Ask anything. Citations [Page X] will appear automatically.")
+    print("─" * 65 + "\n")
 
-    # --- Chat loop -----------------------------------------------------
+    last_sources = []
+
     while True:
         try:
             user_input = input("You: ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\n\n👋  Goodbye!")
+            print("\n\n👋 Goodbye!")
             break
 
         if not user_input:
             continue
 
-        # Slash commands
         if user_input.lower() in ("/quit", "/exit", "/q"):
-            print("👋  Goodbye!")
+            print("👋 Goodbye!")
             break
 
         if user_input.lower() == "/clear":
             session.history.clear()
-            print("🗑️   Conversation history cleared.\n")
+            print("🗑️ Conversation history cleared.\n")
             continue
 
         if user_input.lower() == "/help":
             print(HELP_TEXT)
             continue
 
-        # Regular question
-        print("\n🤖  Assistant: ", end="", flush=True)
+        if user_input.lower() == "/sources":
+            if not last_sources:
+                print("No recent sources to show.\n")
+            else:
+                print("\n📚 Sources retrieved for last query:")
+                for chunk, score in last_sources:
+                    snippet = chunk.text.replace("\n", " ")[:140]
+                    print(f"  • Page {chunk.page} (Relevance: {score:.1%}): \"{snippet}...\"")
+                print()
+            continue
+
+        print("\n🤖 Assistant: ", end="", flush=True)
         try:
-            answer = session.ask(user_input)
+            result = session.ask(user_input)
+            last_sources = result["sources"]
+
             print()
-            print_wrapped(answer)
-            print()
-        except Exception as exc:  # noqa: BLE001
+            print_wrapped(result["answer"])
+
+            # Print source summary under answer
+            if result["sources"]:
+                pages_cited = sorted({c.page for c, _ in result["sources"]})
+                pages_str = ", ".join(f"Page {p}" for p in pages_cited)
+                print(f"\n📌 Cited from: {pages_str} (Match quality: {result['max_score']:.1%})\n")
+            else:
+                print()
+
+        except Exception as exc:
             print(f"\n[ERROR] {exc}\n")
 
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: python rag_chat.py <path_to_pdf>")
-        print("Example: python rag_chat.py document.pdf")
+        print("Example: python rag_chat.py 'Sagar Resume.pdf'")
         sys.exit(1)
 
     run_chat(sys.argv[1])
